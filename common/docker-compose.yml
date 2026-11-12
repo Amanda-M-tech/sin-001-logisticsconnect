@@ -1,7 +1,6 @@
-version: "3.8"
 services:
   activemq:
     image: apache/activemq-classic:5.18.3
     ports:
-      - "61616:61616"   # OpenWire (client connections)
-      - "8161:8161"     # Web console
+      - "61616:61616"
+      - "8161:8161"
