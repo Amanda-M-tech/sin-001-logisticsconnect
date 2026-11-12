@@ -1,7 +1,7 @@
-
 package co.wethinkcode.logisticsconnect;
 
 import io.javalin.Javalin;
+import io.javalin.http.Context;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -9,33 +9,60 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
-/** Stage 1, step 1: read hubs-global.csv and clean every field. */
+/** Stage 1: read hubs-global.csv, clean every field, remove duplicates, serve over REST. */
 public class IngestionServiceApp {
 
     static final int PORT = 7050;
 
-    // The official spellings. Anything that "looks like" one of these gets turned into it.
     static final String[] PROVINCES = {
             "Eastern Cape", "Free State", "Gauteng", "KwaZulu-Natal", "Limpopo",
             "Mpumalanga", "North West", "Northern Cape", "Western Cape"
     };
 
-    // Values that really mean "nobody filled this in".
     static final String[] PLACEHOLDERS = {"", "n/a", "na", "tbd", "unknown", "-", "nan"};
 
-    public static void main(String[] args) throws IOException {
-        List<Hub> hubs = loadHubs("/hubs-global.csv");
+    // The final, cleaned, de-duplicated list that the endpoints serve.
+    static List<Hub> cleanedHubs = new ArrayList<>();
 
-        for (Hub hub : hubs) {
+    public static void main(String[] args) throws IOException {
+        List<Hub> rawHubs = loadHubs("/hubs-global.csv");
+        cleanedHubs = deduplicate(rawHubs);
+
+        System.out.println("Rows read: " + rawHubs.size());
+        System.out.println("After removing duplicates: " + cleanedHubs.size());
+        for (Hub hub : cleanedHubs) {
             System.out.println(hub);
         }
-        System.out.println("Cleaned rows: " + hubs.size());
 
         Javalin app = Javalin.create();
         app.get("/health", ctx -> ctx.result("OK"));
+        app.get("/hubs", IngestionServiceApp::getAllHubs);
+        app.get("/hubs/{hubId}", IngestionServiceApp::getOneHub);
         app.start(PORT);
+    }
+
+    // -------------------------------------------------------------- endpoints
+
+    static void getAllHubs(Context ctx) {
+        ctx.json(cleanedHubs);
+    }
+
+    static void getOneHub(Context ctx) {
+        String id = ctx.pathParam("hubId").trim().toUpperCase();
+
+        for (Hub hub : cleanedHubs) {
+            boolean isMainId = id.equals(hub.hubId);
+            boolean isOldId = hub.aliases.contains(id);   // an id that was merged into this hub
+            if (isMainId || isOldId) {
+                ctx.json(hub);
+                return;
+            }
+        }
+        ctx.status(404).result("Unknown hub " + id);
     }
 
     // ---------------------------------------------------------------- reading
@@ -49,15 +76,15 @@ public class IngestionServiceApp {
         }
 
         BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
-        String line = reader.readLine();              // first line is the header, skip it
+        String line = reader.readLine();              // skip the header
 
         while ((line = reader.readLine()) != null) {
             if (line.isBlank()) {
                 continue;
             }
-            String[] parts = line.split(",", -1);     // -1 keeps empty fields at the end
+            String[] parts = line.split(",", -1);
             if (parts.length < 4) {
-                continue;                             // broken row, skip it
+                continue;
             }
 
             Hub hub = new Hub();
@@ -66,7 +93,7 @@ public class IngestionServiceApp {
             hub.sortingCenter = cleanName(parts[2]);
             hub.active = cleanFlag(parts[3]);
 
-            if (hub.hubId != null) {                  // a row with no id is useless
+            if (hub.hubId != null) {
                 hubs.add(hub);
             }
         }
@@ -76,7 +103,6 @@ public class IngestionServiceApp {
 
     // --------------------------------------------------------------- cleaning
 
-    /** Trim the ends, squash double spaces, and turn placeholders into null. */
     static String cleanText(String raw) {
         String text = raw.trim().replaceAll("\\s+", " ");
         for (String placeholder : PLACEHOLDERS) {
@@ -92,10 +118,9 @@ public class IngestionServiceApp {
         if (text == null) {
             return null;
         }
-        return text.toUpperCase();                    // h-501 -> H-501
+        return text.toUpperCase();
     }
 
-    /** Match against the official list by comparing letters only, so "Kwa-Zulu Natal" still matches. */
     static String cleanProvince(String raw) {
         String text = cleanText(raw);
         if (text == null) {
@@ -107,7 +132,7 @@ public class IngestionServiceApp {
                 return province;
             }
         }
-        return titleCase(text);                       // not in the list, at least tidy it up
+        return titleCase(text);
     }
 
     static String cleanName(String raw) {
@@ -118,7 +143,6 @@ public class IngestionServiceApp {
         return titleCase(text);
     }
 
-    /** Y / yes / true / 1  ->  true.   N / no / false / 0  ->  false.   Anything else -> null. */
     static Boolean cleanFlag(String raw) {
         String text = cleanText(raw);
         if (text == null) {
@@ -154,18 +178,99 @@ public class IngestionServiceApp {
         return result.toString();
     }
 
+    // ---------------------------------------------------------- deduplication
+
+    /**
+     * Rule: two rows are the same hub if they have the same sorting center
+     * (compared by letters only). Rows with no sorting center are never merged.
+     */
+    static List<Hub> deduplicate(List<Hub> hubs) {
+        Map<String, List<Hub>> groups = new LinkedHashMap<>();
+
+        for (Hub hub : hubs) {
+            String key;
+            if (hub.sortingCenter != null) {
+                key = lettersOnly(hub.sortingCenter);
+            } else {
+                key = "no-center-" + hub.hubId;
+            }
+
+            List<Hub> group = groups.get(key);
+            if (group == null) {
+                group = new ArrayList<>();
+                groups.put(key, group);
+            }
+            group.add(hub);
+        }
+
+        List<Hub> result = new ArrayList<>();
+        for (List<Hub> group : groups.values()) {
+            result.add(mergeGroup(group));
+        }
+        return result;
+    }
+
+    /**
+     * Winner = the row with the most filled-in fields. If tied, the lowest hub id.
+     * The losing ids are kept as aliases, and any empty field on the winner
+     * is filled in from the losers.
+     */
+    static Hub mergeGroup(List<Hub> group) {
+        Hub best = group.get(0);
+        for (Hub candidate : group) {
+            int candidateScore = candidate.filledFields();
+            int bestScore = best.filledFields();
+            if (candidateScore > bestScore
+                    || (candidateScore == bestScore && candidate.hubId.compareTo(best.hubId) < 0)) {
+                best = candidate;
+            }
+        }
+
+        Hub merged = new Hub();
+        merged.hubId = best.hubId;
+        merged.province = best.province;
+        merged.sortingCenter = best.sortingCenter;
+        merged.active = best.active;
+
+        for (Hub other : group) {
+            if (other == best) {
+                continue;
+            }
+            merged.aliases.add(other.hubId);
+            if (merged.province == null) {
+                merged.province = other.province;
+            }
+            if (merged.sortingCenter == null) {
+                merged.sortingCenter = other.sortingCenter;
+            }
+            if (merged.active == null) {
+                merged.active = other.active;
+            }
+        }
+        return merged;
+    }
+
     // ------------------------------------------------------------------ model
 
-    /** One cleaned row. Fields are null when the CSV had nothing usable. */
-    static class Hub {
-        String hubId;
-        String province;
-        String sortingCenter;
-        Boolean active;
+    /** Public fields so Jackson can turn this into JSON. */
+    public static class Hub {
+        public String hubId;
+        public String province;
+        public String sortingCenter;
+        public Boolean active;
+        public List<String> aliases = new ArrayList<>();
+
+        int filledFields() {
+            int count = 0;
+            if (province != null) count++;
+            if (sortingCenter != null) count++;
+            if (active != null) count++;
+            return count;
+        }
 
         @Override
         public String toString() {
-            return hubId + " | " + province + " | " + sortingCenter + " | " + active;
+            return hubId + " | " + province + " | " + sortingCenter + " | " + active + " | aliases " + aliases;
         }
     }
 }
